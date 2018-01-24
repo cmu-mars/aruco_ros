@@ -37,6 +37,7 @@ or implied, of Rafael Muñoz Salinas.
 #include <aruco/aruco.h>
 #include <aruco/cvdrawingutils.h>
 
+#include <opencv2/core/core.hpp>
 #include <ros/ros.h>
 #include <image_transport/image_transport.h>
 #include <cv_bridge/cv_bridge.h>
@@ -45,6 +46,8 @@ or implied, of Rafael Muñoz Salinas.
 #include <aruco_msgs/MarkerArray.h>
 #include <tf/transform_listener.h>
 #include <std_msgs/UInt32MultiArray.h>
+#include <tf/transform_broadcaster.h>
+#include <tf/transform_datatypes.h>
 
 class ArucoMarkerPublisher
 {
@@ -77,32 +80,51 @@ private:
   cv::Mat inImage_;
   bool useCamInfo_;
   std_msgs::UInt32MultiArray marker_list_msg_;
+  tf::StampedTransform rightToLeft;
+  bool cam_info_received;
+  ros::Subscriber cam_info_sub;
+  tf::TransformBroadcaster br_;
+
+
 
 public:
   ArucoMarkerPublisher()
     : nh_("~")
     , it_(nh_)
     , useCamInfo_(true)
+    , cam_info_received(false)
   {
     image_sub_ = it_.subscribe("/image", 1, &ArucoMarkerPublisher::image_callback, this);
 
     nh_.param<bool>("use_camera_info", useCamInfo_, true);
-    if(useCamInfo_)
-    {
-      sensor_msgs::CameraInfoConstPtr msg = ros::topic::waitForMessage<sensor_msgs::CameraInfo>("/camera_info", nh_);//, 10.0);
-      camParam_ = aruco_ros::rosCameraInfo2ArucoCamParams(*msg, useRectifiedImages_);
+    cam_info_sub = nh_.subscribe("/camera_info", 1, &ArucoMarkerPublisher::cam_info_callback, this);
+    nh_.param<bool>("image_is_rectified", useRectifiedImages_, true);
+
+    // if(useCamInfo_)
+    // {
+
+    //   sensor_msgs::CameraInfoConstPtr msg = ros::topic::waitForMessage<sensor_msgs::CameraInfo>("/camera_info", nh_);//, 10.0);
+    //   camParam_ = aruco_ros::rosCameraInfo2ArucoCamParams(*msg, useRectifiedImages_);
       nh_.param<double>("marker_size", marker_size_, 0.05);
       nh_.param<bool>("image_is_rectified", useRectifiedImages_, true);
       nh_.param<std::string>("reference_frame", reference_frame_, "");
       nh_.param<std::string>("camera_frame", camera_frame_, "");
-      ROS_ASSERT(not (camera_frame_.empty() and not reference_frame_.empty()));
+    //   ROS_ASSERT(not camera_frame_.empty());
       if(reference_frame_.empty())
         reference_frame_ = camera_frame_;
-    }
-    else
-    {
-      camParam_ = aruco::CameraParameters();
-    }
+
+    //   rightToLeft.setIdentity();
+    //   rightToLeft.setOrigin(
+    //     tf::Vector3(
+    //         -msg->P[3]/msg->P[0],
+    //         -msg->P[7]/msg->P[5],
+    //         0.0));
+    //   ROS_INFO_STREAM("=====================+> Set rightToLeft");
+    // }
+    // else
+    // {
+    //   camParam_ = aruco::CameraParameters();
+    // }
 
     image_pub_ = it_.advertise("result", 1);
     debug_pub_ = it_.advertise("debug", 1);
@@ -148,15 +170,63 @@ public:
     return true;
   }
 
+    // wait for one camerainfo, then shut down that subscriber
+  void cam_info_callback(const sensor_msgs::CameraInfo &msg)
+  {
+    camParam_= aruco_ros::rosCameraInfo2ArucoCamParams(msg, useRectifiedImages_);
+
+    // handle cartesian offset between stereo pairs
+    // see the sensor_msgs/CamaraInfo documentation for details
+    rightToLeft.setIdentity();
+    rightToLeft.setOrigin(
+        tf::Vector3(
+            -msg.P[3]/msg.P[0],
+            -msg.P[7]/msg.P[5],
+            0.0));
+
+    cam_info_received = true;
+    cam_info_sub.shutdown();
+  }
+
+  void publish_transforms(const ros::Time curr_stamp)
+  {
+    tf::StampedTransform c2r;
+    c2r.setIdentity();
+    if (reference_frame_ != camera_frame_) {
+      getTransform(reference_frame_, camera_frame_, c2r);
+    }
+
+    // Publish the transforms
+    for (size_t i=0; i<markers_.size(); i++) {
+      std::stringstream ss;
+      ss << markers_[i].id;
+      std::string mid = "/Marker" + ss.str();
+      tf::Transform transform = aruco_ros::arucoMarker2Tf(markers_[i]);
+
+      transform = static_cast<tf::Transform>(c2r) * 
+                  static_cast<tf::Transform>(rightToLeft) * 
+                  transform;
+      tf::Transform m;
+      m.setRotation(tf::Quaternion(0.5, -0.5, -0.5, 0.5));
+      m.setOrigin(tf::Vector3(.25, 0, 0));
+      transform = transform * m;
+
+
+      br_.sendTransform(tf::StampedTransform(transform, curr_stamp, reference_frame_, mid.c_str()));
+    }
+  }
+
   void image_callback(const sensor_msgs::ImageConstPtr& msg)
   {
+
+      if (!cam_info_received) return;
       bool publishMarkers = marker_pub_.getNumSubscribers() > 0;
       bool publishMarkersList = marker_list_pub_.getNumSubscribers() > 0;
       bool publishImage = image_pub_.getNumSubscribers() > 0;
       bool publishDebug = debug_pub_.getNumSubscribers() > 0;
 
-      if(!publishMarkers && !publishMarkersList && !publishImage && !publishDebug)
-        return;
+      // if(!publishMarkers && !publishMarkersList && !publishImage && !publishDebug)
+      //   return;
 
       ros::Time curr_stamp(ros::Time::now());
       cv_bridge::CvImagePtr cv_ptr;
@@ -171,6 +241,8 @@ public:
         //Ok, let's detect
         mDetector_.detect(inImage_, markers_, camParam_, marker_size_, false);
 
+        // Marker Transform publish
+        publish_transforms(curr_stamp);
         // marker array publish
         if(publishMarkers)
         {
@@ -201,21 +273,13 @@ public:
                   cameraToReference);
             }
 
-            //Now find the transform for each detected marker
-            for(size_t i=0; i<markers_.size(); ++i)
-            {
-              aruco_msgs::Marker & marker_i = marker_msg_->markers.at(i);
-              tf::Transform transform = aruco_ros::arucoMarker2Tf(markers_[i]);
-              transform = static_cast<tf::Transform>(cameraToReference) * transform;
-              tf::poseTFToMsg(transform, marker_i.pose.pose);
-              marker_i.header.frame_id = reference_frame_;
-            }
           }
 
           //publish marker array
           if (marker_msg_->markers.size() > 0)
             marker_pub_.publish(marker_msg_);
         }
+
 
         if(publishMarkersList)
         {
@@ -273,7 +337,7 @@ public:
 int main(int argc,char **argv)
 {
   ros::init(argc, argv, "aruco_marker_publisher");
-
+  ROS_INFO("Starting BRASS Aruco publisher");
   ArucoMarkerPublisher node;
 
   ros::spin();
