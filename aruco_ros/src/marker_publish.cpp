@@ -48,6 +48,7 @@ or implied, of Rafael Muñoz Salinas.
 #include <std_msgs/UInt32MultiArray.h>
 #include <tf/transform_broadcaster.h>
 #include <tf/transform_datatypes.h>
+#include <boost/algorithm/string.hpp>
 
 class ArucoMarkerPublisher
 {
@@ -84,7 +85,8 @@ private:
   bool cam_info_received;
   ros::Subscriber cam_info_sub;
   tf::TransformBroadcaster br_;
-
+  tf::Quaternion marker_rotation_;
+  tf::Vector3 marker_translation_;
 
 
 public:
@@ -99,6 +101,19 @@ public:
     nh_.param<bool>("use_camera_info", useCamInfo_, true);
     cam_info_sub = nh_.subscribe("/camera_info", 1, &ArucoMarkerPublisher::cam_info_callback, this);
     nh_.param<bool>("image_is_rectified", useRectifiedImages_, true);
+
+    std::string rot_fix;
+    nh_.param<std::string>("rotation_fix", rot_fix, "0 0 0 0 0 0 1");
+    std::vector<std::string> q;
+    boost::split(q, rot_fix, boost::is_any_of(", "));
+
+    ROS_INFO_NAMED("aruco", "got rotation of %s", rot_fix.c_str());
+
+    double tx=atof(q[0].c_str()), ty=atof(q[1].c_str()), tz=atof(q[2].c_str()), 
+      x = atof(q[3].c_str()), y = atof(q[4].c_str()), z = atof(q[5].c_str()), w = atof(q[6].c_str());
+  
+    marker_translation_ = tf::Vector3(tx, ty, tz);
+    marker_rotation_ = tf::Quaternion(x, y, z, w);
 
     // if(useCamInfo_)
     // {
@@ -207,8 +222,11 @@ public:
                   static_cast<tf::Transform>(rightToLeft) * 
                   transform;
       tf::Transform m;
-      m.setRotation(tf::Quaternion(0.5, -0.5, -0.5, 0.5));
-      m.setOrigin(tf::Vector3(.25, 0, 0));
+      // m.setRotation(tf::Quaternion(0.5, -0.5, -0.5, 0.5));
+      m.setRotation(this->marker_rotation_);
+      m.setOrigin(this->marker_translation_);
+      
+      // BRS: THe below line is necessary in the real system
       transform = transform * m;
 
 
